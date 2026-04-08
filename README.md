@@ -36,3 +36,7 @@ bash scripts/eval.sh ${DATASET}
 
 We sincerely thank Prof. Kaiyang Zhou for the great work [CoOp](https://github.com/KaiyangZhou/CoOp), [Dassl.pytorch](https://github.com/KaiyangZhou/Dassl.pytorch) and Dr. Muhammad Uzair Khattak for the great work [PromptSRC](https://github.com/muzairkhattak/PromptSRC). We borrow codes heavily from their repositories.
 
+# 复现记录
+我使用的是re0312环境,当前安装的包都在 ./packages.txt 下。
+
+2026年4月7日

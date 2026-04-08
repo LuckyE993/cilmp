@@ -1,2 +1,4 @@
 .codex
 paper
+.vscode
+__pycache__
