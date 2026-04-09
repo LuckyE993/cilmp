@@ -2,3 +2,6 @@
 paper
 .vscode
 __pycache__
+output
+llm_representations/
+llm_representations_8B_Instruct/
