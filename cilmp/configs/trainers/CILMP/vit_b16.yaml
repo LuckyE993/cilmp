@@ -24,6 +24,10 @@ OPTIM:
 TRAIN:
   PRINT_FREQ: 20
 
+  # need to remove
+TEST:
+  VAL_FREQ: 4
+
 MODEL:
   BACKBONE:
     NAME: "ViT-B/16"
@@ -43,4 +47,3 @@ TRAINER:
     LOW_RANK_DIMENSION: 8
     GPA_MEAN: 100
     GPA_STD: 30
-
