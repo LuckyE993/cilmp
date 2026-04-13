@@ -1,11 +1,45 @@
 #!/usr/bin/env python3
-"""Build hicervix_level2.json from the original HiCervix train/val/test CSV files."""
+"""Build hicervix_level2 JSON splits from the original HiCervix train/val/test CSV files.
+
+Bash examples:
+
+# Full level-2 split (default output: <dataset-root>/hicervix_level2.json)
+python scripts/prepare_hicervix_level2_dataset.py \
+  --dataset-root /home/lab217/qixuan/datasets/hicervix \
+  --overwrite
+
+# Keep one quarter of each class inside every split with a fixed seed
+python scripts/prepare_hicervix_level2_dataset.py \
+  --dataset-root /home/lab217/qixuan/datasets/hicervix \
+  --output-json /home/lab217/qixuan/datasets/hicervix/hicervix_level2_quarter_seed1.json \
+  --sample-ratio 0.25 \
+  --seed 1 \
+  --overwrite
+
+# Train on the quarter split without changing the dataset class
+python train.py \
+  --root /home/lab217/qixuan/datasets \
+  --seed 1 \
+  --trainer CILMP \
+  --dataset-config-file configs/datasets/hicervix_level2.yaml \
+  --config-file configs/trainers/CILMP/vit_b16.yaml \
+  --output-dir output/hicervix_level2_quarter_seed1/CILMP/vit_b16_fullshot/seed1 \
+  DATALOADER.TRAIN_X.BATCH_SIZE 16 \
+  DATALOADER.TEST.BATCH_SIZE 16 \
+  DATASET.NUM_SHOTS -1 \
+  DATASET.SPLIT_FILE hicervix_level2_quarter_seed1.json \
+  TEST.PER_CLASS_RESULT True \
+  TEST.VAL_FREQ 0 \
+  TEST.FINAL_MODEL last_step \
+  OPTIM.MAX_EPOCH 30
+"""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import random
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -33,6 +67,18 @@ def parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Overwrite an existing hicervix_level2.json file.",
+    )
+    parser.add_argument(
+        "--sample-ratio",
+        type=float,
+        default=1.0,
+        help="Optional per-class sampling ratio applied independently within train/val/test.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="Random seed used when --sample-ratio is smaller than 1.",
     )
     return parser.parse_args()
 
@@ -100,8 +146,33 @@ def summarize(items: Iterable[Tuple[str, int, str]]) -> Dict[str, int]:
     return dict(Counter(classname for _, _, classname in items))
 
 
+def subsample_items(
+    items: Sequence[Tuple[str, int, str]],
+    sample_ratio: float,
+    rng: random.Random,
+) -> List[Tuple[str, int, str]]:
+    if sample_ratio >= 1:
+        return list(items)
+
+    indices_by_class: Dict[str, List[int]] = {}
+    for index, item in enumerate(items):
+        indices_by_class.setdefault(item[2], []).append(index)
+
+    kept_indices = set()
+    for indices in indices_by_class.values():
+        keep = max(1, int(len(indices) * sample_ratio))
+        if keep >= len(indices):
+            kept_indices.update(indices)
+            continue
+        kept_indices.update(rng.sample(indices, keep))
+
+    return [item for index, item in enumerate(items) if index in kept_indices]
+
+
 def main() -> None:
     args = parse_args()
+    if not 0 < args.sample_ratio <= 1:
+        raise ValueError("--sample-ratio must be in the range (0, 1].")
 
     dataset_root = args.dataset_root.expanduser().resolve()
     if not dataset_root.is_dir():
@@ -118,16 +189,19 @@ def main() -> None:
     split_rows = {split: read_split_rows(dataset_root, split) for split in SPLITS}
     classnames = collect_label_order(split_rows)
     label_to_index = {label: index for index, label in enumerate(classnames)}
+    rng = random.Random(args.seed)
 
-    payload = {
-        split: build_items(dataset_root, split, split_rows[split], label_to_index)
-        for split in SPLITS
-    }
+    payload = {}
+    for split in SPLITS:
+        items = build_items(dataset_root, split, split_rows[split], label_to_index)
+        payload[split] = subsample_items(items, args.sample_ratio, rng)
 
     output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     print(f"Saved split to {output_json}")
     print(f"classes ({len(classnames)}): {classnames}")
+    print(f"sample_ratio: {args.sample_ratio}")
+    print(f"seed: {args.seed}")
     for split in SPLITS:
         print(f"{split}: {len(payload[split])} {summarize(payload[split])}")
 

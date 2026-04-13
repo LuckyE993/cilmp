@@ -63,7 +63,8 @@ class HICERVIX_LEVEL2(DatasetBase):
         root = os.path.abspath(os.path.expanduser(cfg.DATASET.ROOT))
         self.dataset_dir = os.path.join(root, self.dataset_dir)
         self.image_dir = os.path.join(self.dataset_dir)
-        self.split_path = os.path.join(self.dataset_dir, "hicervix_level2.json")
+        split_filename = getattr(cfg.DATASET, "SPLIT_FILE", "") or "hicervix_level2.json"
+        self.split_path = os.path.join(self.dataset_dir, split_filename)
 
         train, val, test = self.read_split(self.split_path, self.image_dir)
 
