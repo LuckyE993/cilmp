@@ -9,6 +9,8 @@ from transformers.activations import ACT2FN
 import os.path as osp
 import math
 
+from llm_representation_utils import resolve_llm_representation_path
+
 class Bottleneck(nn.Module):
     expansion = 4
 
@@ -319,52 +321,13 @@ class ResidualAttentionBlock_IVLP(nn.Module):
                     max_len = 0
                     min_len = 1000
                     n_cls = len(classnames)
+                    dataset_name = design_details.get("dataset_name", "")
                     for name in classnames:
-                        if len(classnames) == 8:
-                            if "esophagitis" in classnames: 
-                                # kvasir
-                                path = osp.join('llm_representations/kvasir', name + '.pth')
-                            elif "lymphocyte" in classnames: # bloodmnist
-                                path = osp.join('llm_representations/bloodmnist', name + '.pth')
-                            else:
-                                # odir
-                                path = osp.join('llm_representations/odir', name + '.pth')
-                        elif len(classnames) == 7:
-                            # for dermamnist:
-                            if "actinic keratoses and intraepithelial carcinoma" in classnames:
-                                path = osp.join('llm_representations/dermamnist', name + '.pth')
-                            else:
-                                path = osp.join('llm_representations/isic', name + '.pth')
-
-                        elif len(classnames) == 2:
-                            if "pneumonia" in classnames:
-                                path = osp.join('llm_representations/pneumonia2', name + '.pth')
-                            elif "cataract" in classnames: # odir_simple = odir2
-                                path = osp.join('llm_representations/odir2', name + '.pth')
-                            else:  # adam
-                                path = osp.join('llm_representations/adam', name + '.pth')
-                        elif len(classnames) == 3:
-                            if "malignant" in classnames: # busi
-                                path = osp.join('llm_representations/busi', name + '.pth')
-                            elif "covid" in classnames: # cpn_x_ray
-                                path = osp.join('llm_representations/cpn_x_ray', name + '.pth')
-                            else:  # pneumonia3
-                                path = osp.join('llm_representations/pneumonia3', name + '.pth')
-                        elif len(classnames) == 6: # fetal_us
-                            path = osp.join('llm_representations/fetal_us', name + '.pth')
-                        elif len(classnames) == 5: # aptos 2019
-                            if "nevus" in classnames:
-                                # derm7pt
-                                name = name.split(" ")[-1]
-                                path = osp.join('llm_representations/derm7pt', name + '.pth')
-                            else:
-                                # aptos 2019
-                                path = osp.join('llm_representations/aptos2019', name + '.pth')
-                        elif len(classnames) == 4: # chaoyang
-                            path = osp.join('llm_representations/chaoyang', name + '.pth')
-                        else:
-                            name = name.split(" ")[-1]
-                            path = osp.join('llm_representations/derm7pt', name + '.pth')
+                        path = resolve_llm_representation_path(
+                            classname=name,
+                            dataset_name=dataset_name,
+                            classnames=classnames,
+                        )
 
                         llm_hidden_rep = torch.load(path)
                         max_len = max(max_len, len(llm_hidden_rep))

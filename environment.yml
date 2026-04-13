@@ -1,0 +1,6 @@
+name: re0312
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+prefix: /home/lab217/miniconda3/envs/re0312

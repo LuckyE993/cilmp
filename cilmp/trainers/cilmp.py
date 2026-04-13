@@ -12,6 +12,7 @@ from dassl.utils import load_pretrained_weights, load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
+from llm_representation_utils import resolve_llm_representation_path
 from .imagenet_templates import IMAGENET_TEMPLATES
 from transformers.activations import ACT2FN
 
@@ -37,6 +38,7 @@ def load_clip_to_cpu(cfg, zero_shot_model=False):
                           "vision_ctx": cfg.TRAINER.PROMPTSRC.N_CTX_VISION,
                           "language_ctx": cfg.TRAINER.PROMPTSRC.N_CTX_TEXT,
                           "classnames": cfg.classnames,
+                          "dataset_name": cfg.DATASET.NAME,
                           'prefix_length': cfg.TRAINER.PROMPTSRC.PREFIX_LENGTH,
                           'suffix_length': cfg.TRAINER.PROMPTSRC.SUFFIX_LENGTH,
                           'low_rank_dimension': cfg.TRAINER.PROMPTSRC.LOW_RANK_DIMENSION
@@ -235,54 +237,14 @@ class VLPromptLearner(nn.Module):
         low_rank_dimension = cfg.TRAINER.PROMPTSRC.LOW_RANK_DIMENSION
         max_len = 0
         min_len = 1000
+        dataset_name = cfg.DATASET.NAME
 
         for name in classnames:
-            if len(classnames) == 8:
-                if "esophagitis" in classnames: # kvasir
-                    path = osp.join('llm_representations/kvasir', name + '.pth')
-                elif "lymphocyte" in classnames: # bloodmnist
-                    path = osp.join('llm_representations/bloodmnist', name + '.pth')
-                else: # odir
-                    path = osp.join('llm_representations/odir', name + '.pth')
-                
-
-            elif len(classnames) == 7:
-                # for dermamnist:
-                if "actinic keratoses and intraepithelial carcinoma" in classnames:
-                    path = osp.join('llm_representations/dermamnist', name + '.pth')
-                else:
-                    # for isic
-                    path = osp.join('llm_representations/isic', name + '.pth')
-
-            elif len(classnames) == 2:
-                if "pneumonia" in classnames:
-                    path = osp.join('llm_representations/pneumonia2', name + '.pth')
-                elif "cataract" in classnames:
-                    path = osp.join('llm_representations/odir2', name + '.pth')
-                else:  # adam
-                    path = osp.join('llm_representations/adam', name + '.pth')
-            elif len(classnames) == 3:
-                if "malignant" in classnames: # busi
-                    path = osp.join('llm_representations/busi', name + '.pth')
-                elif "covid" in classnames: # cpn_x_ray
-                    path = osp.join('llm_representations/cpn_x_ray', name + '.pth')
-                else:  # pneumonia3
-                    path = osp.join('llm_representations/pneumonia3', name + '.pth')
-            elif len(classnames) == 6: # fetal_us
-                path = osp.join('llm_representations/fetal_us', name + '.pth')
-            elif len(classnames) == 5: # aptos 2019
-                if "nevus" in classnames:
-                    # derm7pt
-                    name = name.split(" ")[-1]
-                    path = osp.join('llm_representations/derm7pt', name + '.pth')
-                else:
-                    # aptos 2019
-                    path = osp.join('llm_representations/aptos2019', name + '.pth')
-            elif len(classnames) == 4: # chaoyang
-                path = osp.join('llm_representations/chaoyang', name + '.pth')
-            else:
-                name = name.split(" ")[-1]
-                path = osp.join('llm_representations/derm7pt', name + '.pth')
+            path = resolve_llm_representation_path(
+                classname=name,
+                dataset_name=dataset_name,
+                classnames=classnames,
+            )
             llm_hidden_rep = torch.load(path)
             max_len = max(max_len, len(llm_hidden_rep))
             min_len = min(min_len, len(llm_hidden_rep))
@@ -641,4 +603,3 @@ class CILMP(TrainerX):
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
-
