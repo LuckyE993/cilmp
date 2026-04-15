@@ -20,6 +20,7 @@ import datasets.dermamnist
 import datasets.cpn_x_ray
 import datasets.aptos2019
 import datasets.chaoyang
+import datasets.hicervix_5cls
 import datasets.hicervix_level2
 
 

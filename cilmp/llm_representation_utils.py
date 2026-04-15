@@ -12,6 +12,7 @@ DATASET_NAME_TO_SUBDIR = {
     "DERM7PT": "derm7pt",
     "DERMAMNIST": "dermamnist",
     "FETAL_US": "fetal_us",
+    "HICERVIX_5CLS": "hicervix_5cls",
     "HICERVIX_LEVEL2": "hicervix_level2",
     "ISIC": "isic",
     "KVASIR": "kvasir",

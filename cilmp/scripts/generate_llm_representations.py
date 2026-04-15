@@ -175,6 +175,17 @@ DATASET_SPECS: Dict[str, DatasetSpec] = {
         ),
         aliases=("hicervix-level2",),
     ),
+    "hicervix_5cls": DatasetSpec(
+        output_subdir="hicervix_5cls",
+        classnames=(
+            "ASC-US",
+            "ASC-H",
+            "LSIL",
+            "HSIL",
+            "Normal",
+        ),
+        aliases=("hicervix-5cls", "hicervix5cls"),
+    ),
     "odir": DatasetSpec(
         output_subdir="odir",
         classnames=(
