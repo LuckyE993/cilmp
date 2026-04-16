@@ -25,8 +25,17 @@ import datasets.hicervix_level2
 
 
 
+"""训练入口文件。
+
+职责：
+1) 组装配置（默认配置 + 数据集配置 + 方法配置 + 命令行覆盖）；
+2) 构建 Trainer（此项目核心为 CILMP）；
+3) 调度训练/验证流程。
+"""
+
 
 def print_args(args, cfg):
+    """打印命令行参数与最终冻结配置，便于复现实验。"""
     print("***************")
     print("** Arguments **")
     print("***************")
@@ -41,6 +50,7 @@ def print_args(args, cfg):
 
 
 def reset_cfg(cfg, args):
+    """将命令行参数覆盖到配置对象。"""
     if args.root:
         cfg.DATASET.ROOT = args.root
 
@@ -83,6 +93,7 @@ def extend_cfg(cfg):
         cfg.TRAINER.MY_MODEL.PARAM_B = 0.5
         cfg.TRAINER.MY_MODEL.PARAM_C = False
     """
+    # 在 Dassl 默认配置上扩展本项目需要的训练器参数。
     from yacs.config import CfgNode as CN
 
     cfg.TRAINER.COOP = CN()
@@ -105,7 +116,7 @@ def extend_cfg(cfg):
     cfg.TRAINER.MAPLE.PROMPT_DEPTH = 9  # Max 12, minimum 0, for 1 it will act as shallow MaPLe (J=1)
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
 
-    # Config for PromptSRC
+    # PromptSRC/CILMP 主配置（本项目核心参数在这里扩展）。
     cfg.TRAINER.PROMPTSRC = CN()
     cfg.TRAINER.PROMPTSRC.N_CTX_VISION = 4  # number of context vectors at the vision branch
     cfg.TRAINER.PROMPTSRC.N_CTX_TEXT = 4  # number of context vectors at the language branch
@@ -118,6 +129,9 @@ def extend_cfg(cfg):
     cfg.TRAINER.PROMPTSRC.GPA_MEAN = 15
     cfg.TRAINER.PROMPTSRC.GPA_STD = 1
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
+    # LLM 表示干预相关超参：
+    # PREFIX/SUFFIX_LENGTH：对每个类别 LLM token 序列前后各干预多少 token；
+    # LOW_RANK_DIMENSION：低秩干预与投影的秩。
     cfg.TRAINER.PROMPTSRC.PREFIX_LENGTH = 2
     cfg.TRAINER.PROMPTSRC.SUFFIX_LENGTH = 2
     cfg.TRAINER.PROMPTSRC.LOW_RANK_DIMENSION = 16
@@ -136,6 +150,15 @@ def extend_cfg(cfg):
 
 
 def setup_cfg(args):
+    """配置构建顺序：
+    1. Dassl 默认配置；
+    2. 本项目新增字段；
+    3. 数据集 YAML；
+    4. 方法 YAML；
+    5. 命令行显式参数；
+    6. `opts` 列表动态覆盖。
+    最后 freeze 防止训练中被意外篡改。
+    """
     cfg = get_cfg_default()
     extend_cfg(cfg)
 
@@ -159,6 +182,7 @@ def setup_cfg(args):
 
 
 def main(args):
+    """训练主流程。"""
     cfg = setup_cfg(args)
     if cfg.SEED >= 0:
         print("Setting fixed seed: {}".format(cfg.SEED))
@@ -172,13 +196,16 @@ def main(args):
     print("Collecting env info ...")
     print("** System info **\n{}\n".format(collect_env_info()))
 
+    # 由 cfg.TRAINER.NAME 决定构建哪个训练器（本项目通常为 CILMP）。
     trainer = build_trainer(cfg)
 
+    # 仅评估模式：加载 checkpoint 并在测试集上评估。
     if args.eval_only:
         trainer.load_model(args.model_dir, epoch=args.load_epoch)
         trainer.test()
         return
 
+    # 默认执行训练；可通过 --no-train 禁用（用于只做流程检查）。
     if not args.no_train:
         trainer.train()
 

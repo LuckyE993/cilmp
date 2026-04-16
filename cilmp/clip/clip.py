@@ -12,6 +12,15 @@ from tqdm import tqdm
 from .model import build_model
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 
+"""CLIP 模型加载与文本分词工具。
+
+本文件职责：
+1) 下载并校验官方 CLIP 权重；
+2) 构建图像预处理流程；
+3) 加载 JIT / state_dict 版本模型；
+4) 提供统一 tokenize 接口。
+"""
+
 try:
     from torchvision.transforms import InterpolationMode
     BICUBIC = InterpolationMode.BICUBIC
@@ -37,6 +46,7 @@ _MODELS = {
 
 
 def _download(url: str, root: str = os.path.expanduser("~/.cache/clip")):
+    """下载模型文件并用 URL 中的 SHA256 进行完整性校验。"""
     os.makedirs(root, exist_ok=True)
     filename = os.path.basename(url)
 
@@ -46,12 +56,14 @@ def _download(url: str, root: str = os.path.expanduser("~/.cache/clip")):
     if os.path.exists(download_target) and not os.path.isfile(download_target):
         raise RuntimeError(f"{download_target} exists and is not a regular file")
 
+    # 已存在且 hash 一致则直接复用缓存。
     if os.path.isfile(download_target):
         if hashlib.sha256(open(download_target, "rb").read()).hexdigest() == expected_sha256:
             return download_target
         else:
             warnings.warn(f"{download_target} exists, but the SHA256 checksum does not match; re-downloading the file")
 
+    # 分块下载，tqdm 展示进度。
     with urllib.request.urlopen(url) as source, open(download_target, "wb") as output:
         with tqdm(total=int(source.info().get("Content-Length")), ncols=80, unit='iB', unit_scale=True) as loop:
             while True:
@@ -69,6 +81,7 @@ def _download(url: str, root: str = os.path.expanduser("~/.cache/clip")):
 
 
 def _transform(n_px):
+    """CLIP 标准图像预处理：Resize + CenterCrop + Normalize。"""
     return Compose([
         Resize(n_px, interpolation=BICUBIC),
         CenterCrop(n_px),
@@ -79,12 +92,12 @@ def _transform(n_px):
 
 
 def available_models() -> List[str]:
-    """Returns the names of available CLIP models"""
+    """返回支持的 CLIP 模型名称列表。"""
     return list(_MODELS.keys())
 
 
 def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit=False):
-    """Load a CLIP model
+    """加载 CLIP 模型并返回对应预处理。
 
     Parameters
     ----------
@@ -113,23 +126,24 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
         raise RuntimeError(f"Model {name} not found; available models = {available_models()}")
 
     try:
-        # loading JIT archive
+        # 优先加载 JIT 归档（若可用）。
         model = torch.jit.load(model_path, map_location=device if jit else "cpu").eval()
         state_dict = None
     except RuntimeError:
-        # loading saved state dict
+        # 失败时回退为 state_dict 加载。
         if jit:
             warnings.warn(f"File {model_path} is not a JIT archive. Loading as a state dict instead")
             jit = False
         state_dict = torch.load(model_path, map_location="cpu")
 
+    # 非 JIT 模式下，构建“可改写”的 Python 模型结构。
     if not jit:
         model = build_model(state_dict or model.state_dict()).to(device)
         if str(device) == "cpu":
             model.float()
         return model, _transform(model.visual.input_resolution)
 
-    # patch the device names
+    # JIT 图中硬编码了 device，需要手工 patch。
     device_holder = torch.jit.trace(lambda: torch.ones([]).to(torch.device(device)), example_inputs=[])
     device_node = [n for n in device_holder.graph.findAllNodes("prim::Constant") if "Device" in repr(n)][-1]
 
@@ -151,7 +165,7 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
     patch_device(model.encode_image)
     patch_device(model.encode_text)
 
-    # patch dtype to float32 on CPU
+    # CPU 上统一改为 float32，避免半精度算子兼容问题。
     if str(device) == "cpu":
         float_holder = torch.jit.trace(lambda: torch.ones([]).float(), example_inputs=[])
         float_input = list(float_holder.graph.findNode("aten::to").inputs())[1]
@@ -201,13 +215,13 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: b
     -------
     A two-dimensional tensor containing the resulting tokens, shape = [number of input strings, context_length]
     """
+    # 单条字符串统一包装成列表，便于批处理。
     if isinstance(texts, str):
         texts = [texts]
 
     sot_token = _tokenizer.encoder["<|startoftext|>"]
     eot_token = _tokenizer.encoder["<|endoftext|>"]
     all_tokens = [[sot_token] + _tokenizer.encode(text) + [eot_token] for text in texts]
-    # print(f"all_tokens = {all_tokens}")
     result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)
 
     for i, tokens in enumerate(all_tokens):

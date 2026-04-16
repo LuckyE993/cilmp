@@ -1,6 +1,11 @@
 import os.path as osp
 from typing import Sequence
 
+"""LLM 类别表示文件路径解析工具。
+
+项目中每个类别都有一个离线提取的 LLM 隐表示文件（`.pth`）。
+该模块根据数据集名/类别集合，定位对应子目录与文件路径。
+"""
 
 DATASET_NAME_TO_SUBDIR = {
     "ADAM": "adam",
@@ -24,10 +29,17 @@ DATASET_NAME_TO_SUBDIR = {
 
 
 def resolve_llm_representation_subdir(dataset_name: str = "", classnames: Sequence[str] = ()) -> str:
+    """解析 LLM 表示所在子目录。
+
+    优先级：
+    1) 直接用标准化后的数据集名映射；
+    2) 若数据集名不可用，则用类别数量 + 关键类别词做兜底推断。
+    """
     normalized_name = dataset_name.strip().upper()
     if normalized_name in DATASET_NAME_TO_SUBDIR:
         return DATASET_NAME_TO_SUBDIR[normalized_name]
 
+    # 转 tuple 是为了保证只读语义，同时便于多次条件判断。
     classnames = tuple(classnames)
     if len(classnames) == 8:
         if "esophagitis" in classnames:
@@ -66,6 +78,7 @@ def resolve_llm_representation_subdir(dataset_name: str = "", classnames: Sequen
     if len(classnames) == 4:
         return "chaoyang"
 
+    # 仍无法推断时，显式报错，避免静默加载错误数据。
     raise ValueError(
         f"Unable to resolve llm_representations subdir for dataset_name={dataset_name!r} "
         f"and {len(classnames)} classnames."
@@ -77,5 +90,6 @@ def resolve_llm_representation_path(
     dataset_name: str = "",
     classnames: Sequence[str] = (),
 ) -> str:
+    """返回某个类别的 LLM 表示文件路径。"""
     subdir = resolve_llm_representation_subdir(dataset_name=dataset_name, classnames=classnames)
     return osp.join("llm_representations", subdir, classname + ".pth")

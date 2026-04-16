@@ -16,21 +16,33 @@ from llm_representation_utils import resolve_llm_representation_path
 from .imagenet_templates import IMAGENET_TEMPLATES
 from transformers.activations import ACT2FN
 
+"""CILMP 训练器核心实现。
+
+主链路概览：
+1) 读取每个类别的 LLM 隐表示（离线生成）；
+2) 用条件低秩干预（Conditional LoReFT）根据图像特征动态改写 LLM 表示；
+3) 将改写后的表示映射到 CLIP 文本嵌入维度并拼进 prompt；
+4) 通过 CLIP 图文对齐进行分类训练；
+5) 训练时对参数进行高斯加权平均（GPA）以提升稳定性。
+"""
+
 _tokenizer = _Tokenizer()
 
 
 def load_clip_to_cpu(cfg, zero_shot_model=False):
+    """加载 CLIP 到 CPU，并按训练器需求构建可学习 prompt 结构。"""
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
     model_path = clip._download(url)
 
     try:
-        # loading JIT archive
+        # 优先加载 JIT 归档；若失败则回退为 state_dict。
         model = torch.jit.load(model_path, map_location="cpu").eval()
         state_dict = None
 
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
+    # zero_shot_model=True: 仅保留原始 CLIP 编码能力（不引入可学习深层 prompt）。
     if not zero_shot_model:
         design_details = {"trainer": 'IVLP',
                           "vision_depth": cfg.TRAINER.PROMPTSRC.PROMPT_DEPTH_VISION,
@@ -70,6 +82,7 @@ class NoreftIntervention(nn.Module):
         self.act_fn = ACT2FN["linear"]
         
     def forward(self, x):
+        # 在 fp32 里计算提高数值稳定性，最后再转回原 dtype。
         x_dtype = x.dtype
         x = x.to(torch.float32)
         proj_base = self.proj_layer(x)
@@ -81,6 +94,12 @@ class NoreftIntervention(nn.Module):
 
 
 class TextEncoder(nn.Module):
+    """CLIP 文本编码封装。
+
+    支持两种输入：
+    1) 常规 [n_cls, seq, dim]；
+    2) 条件 prompt 展平后的 [bs*n_cls, seq, dim]（配合图像条件文本）。
+    """
     def __init__(self, clip_model):
         super().__init__()
         self.transformer = clip_model.transformer
@@ -90,6 +109,7 @@ class TextEncoder(nn.Module):
         self.dtype = clip_model.dtype
 
     def forward(self, prompts, tokenized_prompts, img_features=None):
+        # 加位置编码后进入文本 Transformer。
         x = prompts + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)
         x = self.transformer(x, img_features)
@@ -99,18 +119,20 @@ class TextEncoder(nn.Module):
         x = x.permute(1, 0, 2)
         x = self.ln_final(x).type(self.dtype)
 
+        # 条件文本时，将 tokenized prompt 扩展到 batch 维后再展平对齐。
         if img_features is not None:
             bs = img_features.shape[0]
             n_cls, len_tokenized_prompts = tokenized_prompts.shape
             tokenized_prompts = tokenized_prompts.unsqueeze(0).repeat(bs, 1, 1)
             tokenized_prompts = tokenized_prompts.view(-1, len_tokenized_prompts)
 
+        # 取 EOT token 位置特征并线性投影到最终文本特征空间。
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
 
         return x
 
 class LowRankRotateLayer(nn.Module):
-    """A linear transformation with orthogonal initialization."""
+    """带正交初始化的低秩旋转层 R。"""
 
     def __init__(self, n, m):
         super().__init__()
@@ -134,6 +156,7 @@ class LoreftIntervention(nn.Module):
         self.act_fn = ACT2FN["linear"]
         
     def forward(self, base):
+        # LoReFT 核心：在低秩子空间中学习“偏移量”，再映射回原空间并残差相加。
         base_dtype = base.dtype
         base = base.to(torch.float32)
         rotated_base = self.rotate_layer(base)
@@ -162,10 +185,12 @@ class ConditionalLoreftIntervention(nn.Module):
         self.low_rank_dimension = low_rank_dimension
 
     def forward(self, base, img_feature):
-
+        # base: [n_cls, d] 或 [1, d]，img_feature: [bs, ctx_dim]
+        # 通过图像特征产生条件权重，使每个样本有不同的文本干预。
         base_org = base.to(torch.float32)
         img_feature_shape = img_feature.shape  
 
+        # 将图像特征映射到与文本特征可交互的空间。
         processed_img_feature = self.image_feature_learned_weight(img_feature.to(torch.float32)) 
         rd = processed_img_feature.unsqueeze(1) * base.to(torch.float32).unsqueeze(0)
         bs = rd.shape[0]
@@ -176,6 +201,7 @@ class ConditionalLoreftIntervention(nn.Module):
         base = base.to(torch.float32)
         rotated_base = self.rotate_layer(base_org)
         output = []
+        # 逐样本执行 LoReFT 变换，得到 [bs, n_cls, d]。
         for base_shifted_i in base_shifted:
             tmp = base_org + torch.matmul(
                 (self.act_fn(base_shifted_i) - rotated_base), self.rotate_layer.weight.T
@@ -187,6 +213,7 @@ class ConditionalLoreftIntervention(nn.Module):
 
 
 class LoraProjection(nn.Module):
+    """LoRA 风格低秩投影：将 LLM 维度映射到 CLIP 文本维度。"""
     def __init__(self, in_dim, low_rank_dim, out_dim):
         super().__init__()
         self.lora_A = nn.Parameter(torch.zeros(low_rank_dim, in_dim))
@@ -195,6 +222,7 @@ class LoraProjection(nn.Module):
         nn.init.kaiming_uniform_(self.lora_B, a=math.sqrt(5))
 
     def forward(self, x):
+        # 等价于 x @ A^T @ B^T，用低秩矩阵减少参数量。
         x_dtype = x.dtype
         x = x.to(torch.float32)
         after_A = F.linear(x, self.lora_A)
@@ -202,6 +230,14 @@ class LoraProjection(nn.Module):
         return after_B.to(x_dtype)
 
 class VLPromptLearner(nn.Module):
+    """视觉条件文本提示学习器（CILMP 核心）。
+
+    组成：
+    - 可学习上下文 token（ctx）；
+    - 每类离线 LLM 表示（llm_prompt）；
+    - 前后缀条件干预模块（prefix/suffix intervention）；
+    - LoRA 投影层（将 LLM 维映射到 CLIP 文本维）。
+    """
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         n_cls = len(classnames)
@@ -216,6 +252,7 @@ class VLPromptLearner(nn.Module):
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
+        # 若提供短文本初始化，则从 CLIP token embedding 中抽取；否则随机初始化。
         if ctx_init and n_ctx <= 4:
             ctx_init = ctx_init.replace("_", " ")
             n_ctx = n_ctx
@@ -229,6 +266,7 @@ class VLPromptLearner(nn.Module):
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
         self.ctx = nn.Parameter(ctx_vectors)
+        # 读取每个类别对应的离线 LLM 隐表示（长度可变）。
         llm_hidden_representations = []
         llm_rep_length = []
         prefix_length = cfg.TRAINER.PROMPTSRC.PREFIX_LENGTH
@@ -262,6 +300,7 @@ class VLPromptLearner(nn.Module):
         add_llm_prompts = [add_llm_prompt_prefix[i] + " " + name + "." for i, name in enumerate(classnames)]
         add_llm_tokenized_prompts = torch.cat([clip.tokenize(p) for p in add_llm_prompts])
         self.add_llm_tokenized_prompts = add_llm_tokenized_prompts
+        # 对齐到同一 max_len（短序列右侧保留未使用区域）。
         self.llm_prompt = torch.empty(len(llm_hidden_representations), max_len, llm_embed_dim).to(ctx_vectors.dtype)
         for index, hr in enumerate(llm_hidden_representations):
             self.llm_prompt[index, :len(hr), :] = hr.to(ctx_vectors.dtype)
@@ -270,6 +309,7 @@ class VLPromptLearner(nn.Module):
         self.suffix_length = suffix_length
         self.low_rank_dimension = low_rank_dimension
         n_cls = len(classnames)
+        # 仅干预 LLM 序列前后部分 token，中间主体保持不变。
         self.prefix_intervention = ConditionalLoreftIntervention(llm_embed_dim, low_rank_dimension, ctx_dim, n_cls)
         self.suffix_intervention = ConditionalLoreftIntervention(llm_embed_dim, low_rank_dimension, ctx_dim, n_cls)
         self.lora_proj = LoraProjection(llm_embed_dim, low_rank_dimension, ctx_dim)
@@ -278,6 +318,7 @@ class VLPromptLearner(nn.Module):
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        # 冻结教师文本特征（多模板均值）可用于扩展损失/分析（当前训练主干未显式用到）。
         clip_model_temp = load_clip_to_cpu(cfg, True).float().cuda()
         clip_model_temp_image = load_clip_to_cpu(cfg, True)
         with torch.no_grad():
@@ -291,6 +332,7 @@ class VLPromptLearner(nn.Module):
                 all_teacher_features.append(text_features.unsqueeze(1))
 
         self.fixed_embeddings = torch.cat(all_teacher_features, dim=1).mean(dim=1)
+        # prefix/suffix 为不可训练 buffer，避免被优化器更新。
         self.register_buffer("token_prefix", embedding[:, :1, :])  
         self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])
 
@@ -300,6 +342,7 @@ class VLPromptLearner(nn.Module):
         self.name_lens = name_lens
 
     def construct_prompts(self, ctx, prefix, suffix, llm_prompt, label=None):
+        """按类别拼接最终 token 序列：[SOS] + ctx + llm_tokens + suffix。"""
         if label is not None:
             prefix = prefix[label]
             suffix = suffix[label]
@@ -310,13 +353,17 @@ class VLPromptLearner(nn.Module):
                 ctx[i],
                 llm_prompt[i, :self.llm_rep_length[i], :],
                 suffix[i]
-                ], dim=0).unsqueeze(0)[:, :77] 
+                ], dim=0).unsqueeze(0)[:, :77]  # CLIP 文本序列上限 77
             prompt.append(prompt_i)
         prompts = torch.cat(prompt, dim=0)
                 
         return prompts
 
     def forward_llm(self, img_fea):
+        """根据图像特征动态生成每个样本的“类别 LLM token 序列”。
+
+        输出形状：`[bs, n_cls, max_llm_len, clip_text_dim]`
+        """
         prefix = self.llm_prompt[:, :self.prefix_length] 
         after_prefix_int = []
         for i in range(self.prefix_length):
@@ -326,6 +373,7 @@ class VLPromptLearner(nn.Module):
 
         bs = after_prefix_int.shape[0]
 
+        # 快路径：所有类别 LLM 序列长度一致，可直接张量化处理。
         if self.llm_rep_length[0] ==  self.llm_rep_length[-1]:
             total_length = self.llm_rep_length[0]
             suffix = self.llm_prompt[:, total_length - self.suffix_length:] 
@@ -347,6 +395,7 @@ class VLPromptLearner(nn.Module):
             after_int = after_int.view(-1, len_total2, dim2)
             n_cls, max_len, dim = after_int.shape
             after_int = after_int.view(-1, dim)
+            # 将 LLM 维度低秩映射到 CLIP 文本 token 维度。
             final_output = self.lora_proj(after_int)
             final_output = final_output.reshape(n_cls, max_len, -1)
             final_output_dim = final_output.shape[-1]
@@ -354,6 +403,7 @@ class VLPromptLearner(nn.Module):
             return final_output
 
         else:
+            # 慢路径：类别间长度不一致，逐类构造后写回统一张量。
             after_suffix_int = []
             unchanged = []
             for i in range(len(self.llm_prompt)): 
@@ -388,6 +438,7 @@ class VLPromptLearner(nn.Module):
             return final_output
 
     def forward(self, img_fea):
+        """生成每个样本、每个类别的完整文本 prompt embedding。"""
         ctx = self.ctx
         if ctx.dim() == 2:
             ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
@@ -404,6 +455,7 @@ class VLPromptLearner(nn.Module):
 
 
 class CustomCLIP(nn.Module):
+    """将 CILMP PromptLearner 与 CLIP 编码器整合成可训练分类模型。"""
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         self.prompt_learner = VLPromptLearner(cfg, classnames, clip_model)
@@ -417,10 +469,12 @@ class CustomCLIP(nn.Module):
         self.n_cls = len(classnames)
 
     def forward(self, image, label=None):
+        # 图像编码并归一化，使用余弦相似度作为分类 logit。
         image_features = self.image_encoder(image.type(self.dtype))
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         tokenized_prompts = self.add_llm_tokenized_prompts
         logit_scale = self.logit_scale.exp()
+        # 每个样本会产生一组“与图像条件相关”的类别文本 prompt。
         prompts = self.prompt_learner(image_features) 
         bs, n_cls, len_prompt, dim = prompts.shape
         prompts_reshape = prompts.view(-1, len_prompt, dim) 
@@ -434,6 +488,7 @@ class CustomCLIP(nn.Module):
             logits_i = logit_scale * image_features_i @ text_features_i.t()
             logits.append(logits_i)  
         logits = torch.cat(logits, dim=0) 
+        # 训练分支返回与 Dassl 训练循环兼容的 tuple（首项为 CE loss）。
         if self.prompt_learner.training and label is not None:
             fixed_embeddings = None
             with torch.no_grad():
@@ -448,6 +503,7 @@ class CustomCLIP(nn.Module):
 
 @TRAINER_REGISTRY.register()
 class CILMP(TrainerX):
+    """Dassl 训练器封装：负责参数冻结、优化器、训练循环与权重平均。"""
     def check_cfg(self, cfg):
         assert cfg.TRAINER.PROMPTSRC.PREC in ["fp16", "fp32", "amp"]
 
@@ -468,6 +524,8 @@ class CILMP(TrainerX):
         print("Turning off gradients in both the image and the text encoder")
         name_to_update = "prompt_learner"
 
+        # 只训练 prompt 相关参数；CLIP 主干冻结。
+        # 特例：intervention/lora_proj 显式放开梯度。
         for name, param in self.model.named_parameters():
             if name_to_update not in name:
                 if "VPT" in name or 'intervention' in name or 'lora_proj' in name: 
@@ -494,6 +552,7 @@ class CILMP(TrainerX):
         N = cfg.OPTIM.MAX_EPOCH
         mean = cfg.TRAINER.PROMPTSRC.GPA_MEAN
         stdev = cfg.TRAINER.PROMPTSRC.GPA_STD
+        # 预计算每个 epoch 的高斯权重，用于训练末尾做参数加权平均（GPA）。
         gauss = self.get_gauss(mean, stdev)
         self.gauss = np.array([gauss(a) for a in range(1, N + 1)])
         self.gauss = self.gauss / sum(self.gauss)
@@ -506,6 +565,7 @@ class CILMP(TrainerX):
 
 
     def forward_backward(self, batch):
+        """单步训练并在每个 epoch 末执行 GPA 累积。"""
         image, label = self.parse_batch_train(batch)
 
         model = self.model
@@ -526,6 +586,10 @@ class CILMP(TrainerX):
             loss.backward()
             optim.step()
         loss_summary = {"loss": loss.item()}
+        # 一个 epoch 结束时：
+        # 1) 更新学习率；
+        # 2) 取当前权重并按高斯系数缩放；
+        # 3) 累加到 previous_model_gpa。
         if (self.batch_idx + 1) == self.num_batches:
             self.update_lr()
             self.step_counter = self.step_counter + 1
@@ -537,6 +601,7 @@ class CILMP(TrainerX):
             else:
                 self.previous_model_gpa = self.state_dict_add(weighted_state_dict, self.previous_model_gpa)
 
+        # 全部 epoch 完成后，将 GPA 结果回写为最终模型参数。
         if self.step_counter == self.model.total_epochs + 1:
             model.load_state_dict(self.previous_model_gpa)
             self.model.load_state_dict(self.previous_model_gpa)
@@ -544,6 +609,10 @@ class CILMP(TrainerX):
 
 
     def state_dict_weighting(self, main_dict, weightage, prompt_only=False):
+        """对 state_dict 施加标量权重。
+
+        intervention/lora_proj 参数不做 GPA 缩放，保持当前值直接传递。
+        """
         updated_dict = copy.deepcopy(main_dict)
         if not prompt_only:
             for key in main_dict:
@@ -556,6 +625,7 @@ class CILMP(TrainerX):
             return main_dict * weightage
 
     def state_dict_add(self, dict1, dict2, prompt_only=False):
+        """两个 state_dict 相加（用于 GPA 累积）。"""
         if not prompt_only:
             modified_dict = dict2
             for key in dict1:
@@ -568,10 +638,12 @@ class CILMP(TrainerX):
             return dict1 + dict2
 
     def get_gauss(self, mu, sigma):
+        """返回高斯函数句柄，用于生成每个 epoch 的加权系数。"""
         gauss = lambda x: (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
         return gauss
 
     def parse_batch_train(self, batch):
+        """解析并搬运训练 batch 到目标设备。"""
         input = batch["img"]
         label = batch["label"]
         input = input.to(self.device)
@@ -579,6 +651,11 @@ class CILMP(TrainerX):
         return input, label
 
     def load_model(self, directory, epoch=None):
+        """加载 checkpoint（评估模式常用）。
+
+        strict=False 的原因：token_prefix/token_suffix 是按当前类别 token 动态生成的 buffer，
+        不应强依赖 checkpoint 中的旧值。
+        """
         if not directory:
             print("Note that load_model() is skipped as no pretrained model is given")
             return
