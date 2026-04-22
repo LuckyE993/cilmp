@@ -24,7 +24,7 @@ OPTIM:
 TRAIN:
   PRINT_FREQ: 20
 
-  # need to remove
+# need to remove
 TEST:
   VAL_FREQ: 4
 
